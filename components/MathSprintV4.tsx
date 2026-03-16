@@ -15,9 +15,9 @@ import {
   Sparkles,
   Star,
   Target,
-  Trophy,
   Users,
 } from 'lucide-react';
+import { supabase } from '@/lib/supabase';
 
 const STORAGE_KEY = 'math_sprint_v4';
 const rand = (min: number, max: number) => Math.floor(Math.random() * (max - min + 1)) + min;
@@ -40,6 +40,20 @@ type Question = {
   options: string[];
 };
 
+type HistoryEntry = {
+  date: string;
+  topic: string;
+  accuracy: number;
+  mins: number;
+};
+
+type WrongLogEntry = {
+  prompt: string;
+  skill: string;
+  selected: string;
+  correct: string;
+};
+
 type Profile = {
   student_name: string;
   grade_band: 'grade4' | 'grade7';
@@ -52,7 +66,7 @@ type Profile = {
   session_length: number;
   mastery: Record<string, number>;
   badges: string[];
-  history: { date: string; topic: string; accuracy: number; mins: number }[];
+  history: HistoryEntry[];
   teacher_assignment: { path: string; length: number; note: string };
   parent_email_preview: string;
 };
@@ -109,6 +123,113 @@ function loadLocal(): Profile {
 function saveLocal(profile: Profile) {
   if (typeof window === 'undefined') return;
   window.localStorage.setItem(STORAGE_KEY, JSON.stringify(profile));
+}
+
+async function getCurrentUserId(): Promise<string | null> {
+  const { data, error } = await supabase.auth.getUser();
+  if (error) {
+    console.error('Error getting user:', error.message);
+    return null;
+  }
+  return data.user?.id ?? null;
+}
+
+async function saveProfileToSupabase(profile: Profile) {
+  const userId = await getCurrentUserId();
+  if (!userId) return;
+
+  const { data: userData } = await supabase.auth.getUser();
+  const email = userData.user?.email ?? '';
+
+  const { error } = await supabase.from('student_profiles').upsert(
+    {
+      user_id: userId,
+      email,
+      student_name: profile.student_name,
+      grade_band: profile.grade_band,
+      active_avatar: profile.active_avatar,
+      unlocked_avatars: profile.unlocked_avatars,
+      xp: profile.xp,
+      gems: profile.gems,
+      level: profile.level,
+      streak_days: profile.streak_days,
+      session_length: profile.session_length,
+      mastery: profile.mastery,
+      badges: profile.badges,
+      history: profile.history,
+      teacher_assignment: profile.teacher_assignment,
+      parent_email_preview: profile.parent_email_preview,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: 'user_id' }
+  );
+
+  if (error) {
+    console.error('Profile save failed:', error.message);
+  }
+}
+
+async function loadProfileFromSupabase(): Promise<Profile | null> {
+  const userId = await getCurrentUserId();
+  if (!userId) return null;
+
+  const { data, error } = await supabase
+    .from('student_profiles')
+    .select('*')
+    .eq('user_id', userId)
+    .single();
+
+  if (error) {
+    console.log('No cloud profile yet, using local/default profile.');
+    return null;
+  }
+
+  if (!data) return null;
+
+  return {
+    ...defaultProfile,
+    student_name: data.student_name ?? defaultProfile.student_name,
+    grade_band: data.grade_band ?? defaultProfile.grade_band,
+    active_avatar: data.active_avatar ?? defaultProfile.active_avatar,
+    unlocked_avatars: data.unlocked_avatars ?? defaultProfile.unlocked_avatars,
+    xp: data.xp ?? defaultProfile.xp,
+    gems: data.gems ?? defaultProfile.gems,
+    level: data.level ?? defaultProfile.level,
+    streak_days: data.streak_days ?? defaultProfile.streak_days,
+    session_length: data.session_length ?? defaultProfile.session_length,
+    mastery: data.mastery ?? defaultProfile.mastery,
+    badges: data.badges ?? defaultProfile.badges,
+    history: data.history ?? defaultProfile.history,
+    teacher_assignment: data.teacher_assignment ?? defaultProfile.teacher_assignment,
+    parent_email_preview: data.parent_email_preview ?? defaultProfile.parent_email_preview,
+  };
+}
+
+async function saveSessionLogToSupabase(params: {
+  topic: string;
+  mode: string;
+  accuracy: number;
+  xp_earned: number;
+  streak_peak: number;
+  responses: WrongLogEntry[];
+}) {
+  const userId = await getCurrentUserId();
+  if (!userId) return;
+
+  const { error } = await supabase.from('session_logs').insert({
+    user_id: userId,
+    topic: params.topic,
+    mode: params.mode,
+    accuracy: params.accuracy,
+    xp_earned: params.xp_earned,
+    streak_peak: params.streak_peak,
+    responses: params.responses,
+    created_at: new Date().toISOString(),
+  });
+
+  if (error) {
+    console.error('Session log save failed:', error.message);
+  }
 }
 
 function makeOptions(correct: string, wrongFn: () => string, count = 4) {
@@ -360,13 +481,28 @@ export default function MathSprintV4() {
   const [sessionStreak, setSessionStreak] = useState(0);
   const [celebration, setCelebration] = useState('');
   const [feedbackTone, setFeedbackTone] = useState<'good' | 'bad'>('good');
-  const [wrongLog, setWrongLog] = useState<{ prompt: string; skill: string; selected: string; correct: string }[]>([]);
+  const [wrongLog, setWrongLog] = useState<WrongLogEntry[]>([]);
   const [teacherPath, setTeacherPath] = useState(defaultProfile.teacher_assignment.path);
   const [teacherLength, setTeacherLength] = useState(defaultProfile.teacher_assignment.length);
   const [showConfetti, setShowConfetti] = useState(false);
 
   useEffect(() => {
-    setProfile(loadLocal());
+    async function initializeProfile() {
+      const localProfile = loadLocal();
+      setProfile(localProfile);
+      setTeacherPath(localProfile.teacher_assignment.path);
+      setTeacherLength(localProfile.teacher_assignment.length);
+
+      const cloudProfile = await loadProfileFromSupabase();
+      if (cloudProfile) {
+        setProfile(cloudProfile);
+        setTeacherPath(cloudProfile.teacher_assignment.path);
+        setTeacherLength(cloudProfile.teacher_assignment.length);
+        saveLocal(cloudProfile);
+      }
+    }
+
+    initializeProfile();
   }, []);
 
   useEffect(() => {
@@ -400,6 +536,7 @@ export default function MathSprintV4() {
     const nextProfile = { ...profile, ...patch } as Profile;
     setProfile(nextProfile);
     saveLocal(nextProfile);
+    void saveProfileToSupabase(nextProfile);
   }
 
   function startSession(nextPath: string) {
@@ -459,20 +596,49 @@ export default function MathSprintV4() {
     };
     const topicKey = keyMap[path];
     const mastery = { ...profile.mastery };
+
     if (topicKey) {
-      mastery[topicKey] = Math.max(40, Math.min(99, mastery[topicKey] + (finalAccuracy >= 90 ? 5 : finalAccuracy >= 80 ? 3 : finalAccuracy >= 70 ? 1 : -1)));
+      mastery[topicKey] = Math.max(
+        40,
+        Math.min(99, mastery[topicKey] + (finalAccuracy >= 90 ? 5 : finalAccuracy >= 80 ? 3 : finalAccuracy >= 70 ? 1 : -1))
+      );
     }
+
     const nextXp = profile.xp + sessionXp;
     const nextGems = profile.gems + (finalAccuracy >= 80 ? 2 : 1);
-    updateProfile({
+
+    const nextProfile: Profile = {
+      ...profile,
       xp: nextXp,
       gems: nextGems,
       level: Math.max(1, Math.floor(nextXp / 100) + 1),
       mastery,
-      history: [...profile.history.slice(-11), { date: `S${profile.history.length + 1}`, topic: topicKey || 'Mixed', accuracy: finalAccuracy, mins: totalQuestions }],
-      badges: Array.from(new Set([...profile.badges, ...(finalAccuracy === 100 ? ['Perfect Sprint'] : []), ...(sessionStreak >= 5 ? ['5 Answer Flame'] : [])])),
+      history: [
+        ...profile.history.slice(-11),
+        { date: `S${profile.history.length + 1}`, topic: topicKey || 'Mixed', accuracy: finalAccuracy, mins: totalQuestions },
+      ],
+      badges: Array.from(
+        new Set([
+          ...profile.badges,
+          ...(finalAccuracy === 100 ? ['Perfect Sprint'] : []),
+          ...(sessionStreak >= 5 ? ['5 Answer Flame'] : []),
+        ])
+      ),
       parent_email_preview: `Weekly report: ${profile.student_name} averaged ${finalAccuracy}% in the latest session and should focus next on ${recommendedPath}.`,
+    };
+
+    setProfile(nextProfile);
+    saveLocal(nextProfile);
+    void saveProfileToSupabase(nextProfile);
+    void saveSessionLogToSupabase({
+      topic: topicKey || 'Mixed',
+      mode: 'sprint',
+      accuracy: finalAccuracy,
+      xp_earned: sessionXp,
+      streak_peak: sessionStreak,
+      responses: wrongLog,
     });
+
     setScreen('summary');
   }
 
@@ -782,8 +948,13 @@ export default function MathSprintV4() {
                 <button
                   className="action-btn top-gap"
                   onClick={() => {
+                    const nextTeacherAssignment = {
+                      path: teacherPath,
+                      length: teacherLength,
+                      note: `Assigned ${teacherPath} for ${teacherLength} questions.`,
+                    };
                     updateProfile({
-                      teacher_assignment: { path: teacherPath, length: teacherLength, note: `Assigned ${teacherPath} for ${teacherLength} questions.` },
+                      teacher_assignment: nextTeacherAssignment,
                       session_length: teacherLength,
                     });
                     startSession(teacherPath);
@@ -813,7 +984,7 @@ export default function MathSprintV4() {
                 <div className="mini-panel">XP shop with unlockable avatars.</div>
                 <div className="mini-panel">Teacher dashboard with assign-and-launch workflow.</div>
                 <div className="mini-panel">Parent weekly report email preview.</div>
-                <div className="mini-panel"><strong>Name save fix included:</strong> the student name field uses direct local state updates through <code>updateProfile()</code>, which immediately updates React state and localStorage on every keystroke.</div>
+                <div className="mini-panel"><strong>Name save fix included:</strong> the student name field uses direct local state updates through <code>updateProfile()</code>, which immediately updates React state, localStorage, and cloud save on every keystroke.</div>
               </div>
             </SectionCard>
           )}
